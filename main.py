@@ -178,19 +178,21 @@ async def split_column(req: SplitColumnRequest):
         logger.info(f"   Sample input: {req.data[0]}")
 
     try:
-        df = pl.DataFrame(req.data, infer_schema_length=0)
+        # Force all columns to Utf8 first
+        df = pl.DataFrame(req.data).select([
+            pl.col(col).cast(pl.Utf8).alias(col) for col in req.data[0].keys()
+        ])
+
         col = req.column
         prefix_col = f"{col} (Currency)"
         number_col = f"{col} (Amount)"
 
         df = df.with_columns([
             pl.col(col)
-            .cast(pl.Utf8)
             .str.extract(r'^(\D*)', 1)
             .alias(prefix_col),
 
             pl.col(col)
-            .cast(pl.Utf8)
             .str.extract(r'(\d+\.?\d*)$', 1)
             .cast(pl.Float64, strict=False)
             .alias(number_col)
@@ -209,7 +211,6 @@ async def split_column(req: SplitColumnRequest):
     except Exception as e:
         logger.error(f"❌ Error in /split/column: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Split failed: {str(e)}")
-
 
 # === ENTRY POINT ===
 
