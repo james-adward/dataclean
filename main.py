@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("datacleaner")
 
-app = FastAPI(title="DataCleaner SaaS Backend", version="1.0")
+app = FastAPI(title="DataCleaner SaaS Backend", version="1.1")
 
 # === DATA MODELS ===
 
@@ -29,10 +29,8 @@ class CleanedResponse(BaseModel):
     message: str
     rows_deleted: Optional[int] = 0
 
-# === ENDPOINTS ===
-# === HELPER FUNCTION: SANITIZE DATA FOR JSON SERIALIZATION ===
 
-# === HELPER: SANITIZE OUTPUT FOR JSON ===
+# === HELPER FUNCTIONS ===
 
 def sanitize_output(data: List[dict]) -> List[dict]:
     """Ensure all values are JSON-serializable"""
@@ -50,27 +48,63 @@ def sanitize_output(data: List[dict]) -> List[dict]:
         for row in data
     ]
 
+
 # === HEALTH CHECK ENDPOINT ===
 
 @app.get("/health")
 def health_check():
-    """
-    Simple health check endpoint to verify the service is running.
-    """
     return {
         "status": "OK",
         "service": "DataCleaner SaaS Backend",
         "polars_version": pl.__version__
     }
 
+
+# === INSPECT SCHEMA ENDPOINT ===
+
+@app.post("/inspect/schema")
+async def inspect_schema(payload: dict):
+    """
+    Inspect how Polars infers schema from provided data.
+    Example body:
+    {
+      "data": [{"Product": "A", "Price": "100"}, {"Product": "B", "Price": ""}]
+    }
+    """
+    try:
+        data = payload.get("data", [])
+        if not data:
+            raise HTTPException(status_code=400, detail="No data provided")
+
+        df = pl.DataFrame(data, infer_schema_length=0)
+        schema_before = df.schema
+
+        # Try casting numeric-looking columns to Float64
+        casted_df = df.with_columns([
+            pl.when(pl.col(col).str.strip_chars().is_in(["", None]))
+            .then(None)
+            .otherwise(pl.col(col))
+            .alias(col)
+            for col in df.columns
+        ])
+
+        schema_after = casted_df.schema
+
+        return {
+            "schema_before": {k: str(v) for k, v in schema_before.items()},
+            "schema_after": {k: str(v) for k, v in schema_after.items()},
+            "sample_row": casted_df.to_dicts()[0] if len(casted_df) > 0 else {}
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error in /inspect/schema: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Schema inspection failed: {str(e)}")
+
+
 # === CLEAN MISSING VALUES ENDPOINT ===
 
 @app.post("/clean/missing", response_model=CleanedResponse)
 async def clean_missing_values(req: MissingValueHandlingRequest):
-    """
-    Clean missing values in specified columns using selected strategy.
-    Strategies: 'mean', 'median', 'zero', 'delete'
-    """
     logger.info(f"▶️ Received /clean/missing request")
     logger.info(f"   Strategy: {req.strategy}")
     logger.info(f"   Columns: {req.columns}")
@@ -79,28 +113,26 @@ async def clean_missing_values(req: MissingValueHandlingRequest):
         logger.info(f"   Sample input: {req.data[0]}")
 
     try:
-        # Convert to Polars DataFrame
         df = pl.DataFrame(req.data, infer_schema_length=0)
+        logger.info(f"Schema before processing: {df.schema}")
         rows_before = len(df)
         deleted_rows = 0
 
-        # Process each selected column
         for col in req.columns:
-            # Convert column to string, then to float — handle blanks and non-numeric
+            # Normalize blanks → None, then cast to float
             df = df.with_columns(
                 pl.col(col)
-                .cast(pl.Utf8)  # Ensure string type first
-                .str.replace_all(r'^\s*$', 'null')  # Replace blank/whitespace with 'null'
-                .cast(pl.Float64, strict=False)  # Convert to float, invalid → null
+                .cast(pl.Utf8)
+                .str.strip_chars()
+                .replace("", None)
+                .cast(pl.Float64, strict=False)
                 .alias(col)
             )
 
-            # Apply cleaning strategy
+            # Apply strategy
             if req.strategy == "delete":
-                # Remove rows where column is null or NaN
                 df = df.filter(pl.col(col).is_not_null() & pl.col(col).is_not_nan())
             else:
-                # Compute fill value
                 if req.strategy == "mean":
                     fill_val = df[col].mean()
                 elif req.strategy == "median":
@@ -110,18 +142,16 @@ async def clean_missing_values(req: MissingValueHandlingRequest):
                 else:
                     raise HTTPException(status_code=400, detail=f"Invalid strategy: {req.strategy}")
 
-                # Fill null values
                 df = df.with_columns(
                     pl.col(col).fill_null(fill_val)
                 )
 
-        # Count deleted rows if strategy was 'delete'
         if req.strategy == "delete":
             deleted_rows = rows_before - len(df)
 
-        # Sanitize output for JSON serialization
-        cleaned_data = sanitize_output(df.to_dicts())
+        logger.info(f"Schema after processing: {df.schema}")
 
+        cleaned_data = sanitize_output(df.to_dicts())
         logger.info(f"✅ Processing complete. Output rows: {len(cleaned_data)}")
         if len(cleaned_data) > 0:
             logger.info(f"   Sample output: {cleaned_data[0]}")
@@ -136,14 +166,11 @@ async def clean_missing_values(req: MissingValueHandlingRequest):
         logger.error(f"❌ Error in /clean/missing: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
+
 # === SPLIT COLUMN ENDPOINT ===
 
 @app.post("/split/column", response_model=CleanedResponse)
 async def split_column(req: SplitColumnRequest):
-    """
-    Split a column into two: non-numeric prefix (currency) and numeric suffix (amount)
-    Example: 'rs12345' → 'rs' and 12345.0
-    """
     logger.info(f"▶️ Received /split/column request")
     logger.info(f"   Column: {req.column}")
     logger.info(f"   Input rows: {len(req.data)}")
@@ -151,23 +178,17 @@ async def split_column(req: SplitColumnRequest):
         logger.info(f"   Sample input: {req.data[0]}")
 
     try:
-        # Convert to Polars DataFrame
         df = pl.DataFrame(req.data, infer_schema_length=0)
         col = req.column
-
-        # Define new column names
         prefix_col = f"{col} (Currency)"
         number_col = f"{col} (Amount)"
 
-        # Perform split using regex
         df = df.with_columns([
-            # Extract non-digit prefix
             pl.col(col)
             .cast(pl.Utf8)
             .str.extract(r'^(\D*)', 1)
             .alias(prefix_col),
 
-            # Extract numeric suffix and convert to float
             pl.col(col)
             .cast(pl.Utf8)
             .str.extract(r'(\d+\.?\d*)$', 1)
@@ -175,10 +196,7 @@ async def split_column(req: SplitColumnRequest):
             .alias(number_col)
         ])
 
- 
-        # Sanitize output for JSON serialization
         cleaned_data = sanitize_output(df.to_dicts())
-
         logger.info(f"✅ Processing complete. Output rows: {len(cleaned_data)}")
         if len(cleaned_data) > 0:
             logger.info(f"   Sample output: {cleaned_data[0]}")
@@ -191,3 +209,9 @@ async def split_column(req: SplitColumnRequest):
     except Exception as e:
         logger.error(f"❌ Error in /split/column: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Split failed: {str(e)}")
+
+
+# === ENTRY POINT ===
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
