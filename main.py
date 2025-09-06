@@ -80,7 +80,7 @@ async def clean_missing_values(req: MissingValueHandlingRequest):
 
     try:
         # Convert to Polars DataFrame
-        df = pl.DataFrame(req.data)
+        df = pl.DataFrame(req.data, infer_schema_length=0)
         rows_before = len(df)
         deleted_rows = 0
 
@@ -152,7 +152,7 @@ async def split_column(req: SplitColumnRequest):
 
     try:
         # Convert to Polars DataFrame
-        df = pl.DataFrame(req.data)
+        df = pl.DataFrame(req.data, infer_schema_length=0)
         col = req.column
 
         # Define new column names
@@ -175,6 +175,7 @@ async def split_column(req: SplitColumnRequest):
             .alias(number_col)
         ])
 
+ 
         # Sanitize output for JSON serialization
         cleaned_data = sanitize_output(df.to_dicts())
 
