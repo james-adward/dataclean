@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("datacleaner")
 
-app = FastAPI(title="DataCleaner SaaS Backend", version="1.1")
+app = FastAPI(title="DataCleaner SaaS Backend", version="1.2")
 
 # === DATA MODELS ===
 
@@ -30,7 +30,7 @@ class CleanedResponse(BaseModel):
     rows_deleted: Optional[int] = 0
 
 
-# === HELPER FUNCTIONS ===
+# === HELPERS ===
 
 def sanitize_output(data: List[dict]) -> List[dict]:
     """Ensure all values are JSON-serializable"""
@@ -47,6 +47,26 @@ def sanitize_output(data: List[dict]) -> List[dict]:
         {k: clean_value(v) for k, v in row.items()}
         for row in data
     ]
+
+
+def normalize_input_rows(rows: List[dict]) -> List[dict]:
+    """
+    Normalize raw input rows to avoid schema mismatch:
+    - Convert everything to string
+    - Replace blank string with None
+    - Keep None as None
+    """
+    normalized = []
+    for row in rows:
+        new_row = {}
+        for k, v in row.items():
+            if v is None:
+                new_row[k] = None
+            else:
+                val = str(v).strip()
+                new_row[k] = val if val != "" else None
+        normalized.append(new_row)
+    return normalized
 
 
 # === HEALTH CHECK ENDPOINT ===
@@ -76,24 +96,12 @@ async def inspect_schema(payload: dict):
         if not data:
             raise HTTPException(status_code=400, detail="No data provided")
 
-        df = pl.DataFrame(data, infer_schema_length=0)
-        schema_before = df.schema
-
-        # Try casting numeric-looking columns to Float64
-        casted_df = df.with_columns([
-            pl.when(pl.col(col).str.strip_chars().is_in(["", None]))
-            .then(None)
-            .otherwise(pl.col(col))
-            .alias(col)
-            for col in df.columns
-        ])
-
-        schema_after = casted_df.schema
+        normalized = normalize_input_rows(data)
+        df = pl.DataFrame(normalized, infer_schema_length=None)
 
         return {
-            "schema_before": {k: str(v) for k, v in schema_before.items()},
-            "schema_after": {k: str(v) for k, v in schema_after.items()},
-            "sample_row": casted_df.to_dicts()[0] if len(casted_df) > 0 else {}
+            "schema": {k: str(v) for k, v in df.schema.items()},
+            "sample_row": df.to_dicts()[0] if len(df) > 0 else {}
         }
 
     except Exception as e:
@@ -113,23 +121,20 @@ async def clean_missing_values(req: MissingValueHandlingRequest):
         logger.info(f"   Sample input: {req.data[0]}")
 
     try:
-        df = pl.DataFrame(req.data, infer_schema_length=0)
+        normalized = normalize_input_rows(req.data)
+        df = pl.DataFrame(normalized, infer_schema_length=None)
         logger.info(f"Schema before processing: {df.schema}")
         rows_before = len(df)
         deleted_rows = 0
 
         for col in req.columns:
-            # Normalize blanks → None, then cast to float
+            # Convert target column to Float64
             df = df.with_columns(
                 pl.col(col)
-                .cast(pl.Utf8)
-                .str.strip_chars()
-                .replace("", None)
                 .cast(pl.Float64, strict=False)
                 .alias(col)
             )
 
-            # Apply strategy
             if req.strategy == "delete":
                 df = df.filter(pl.col(col).is_not_null() & pl.col(col).is_not_nan())
             else:
@@ -178,10 +183,8 @@ async def split_column(req: SplitColumnRequest):
         logger.info(f"   Sample input: {req.data[0]}")
 
     try:
-        # Force all columns to Utf8 first
-        df = pl.DataFrame(req.data).select([
-            pl.col(col).cast(pl.Utf8).alias(col) for col in req.data[0].keys()
-        ])
+        normalized = normalize_input_rows(req.data)
+        df = pl.DataFrame(normalized, infer_schema_length=None)
 
         col = req.column
         prefix_col = f"{col} (Currency)"
@@ -189,10 +192,12 @@ async def split_column(req: SplitColumnRequest):
 
         df = df.with_columns([
             pl.col(col)
+            .cast(pl.Utf8)
             .str.extract(r'^(\D*)', 1)
             .alias(prefix_col),
 
             pl.col(col)
+            .cast(pl.Utf8)
             .str.extract(r'(\d+\.?\d*)$', 1)
             .cast(pl.Float64, strict=False)
             .alias(number_col)
@@ -211,6 +216,7 @@ async def split_column(req: SplitColumnRequest):
     except Exception as e:
         logger.error(f"❌ Error in /split/column: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Split failed: {str(e)}")
+
 
 # === ENTRY POINT ===
 
